@@ -8,6 +8,7 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/tracker"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 )
 
 // Every test uses a dead loopback port: connect returns ECONNREFUSED
@@ -35,7 +36,6 @@ func newRetryTestClient(t *testing.T, mutate func(*ClientConfig)) (*Client, *Tor
 	require.True(t, new)
 	return cl, tor
 }
-
 
 func parkedCount(tor *Torrent) int {
 	tor.cl.lock()
@@ -126,24 +126,40 @@ func TestCooldownSuppressesRediscovery(t *testing.T) {
 // slot release. A parked address must never be redialed by that fan-out before
 // its deadline.
 func TestFanOutCannotRedialParkedPeer(t *testing.T) {
-	_, tor := newRetryTestClient(t, func(cfg *ClientConfig) {
+	cl, tor := newRetryTestClient(t, func(cfg *ClientConfig) {
 		cfg.OutgoingPeerRetryBaseDelay = time.Hour // no due retries during the test
+		cfg.TotalHalfOpenConns = 1
+		cfg.DialRateLimiter = rate.NewLimiter(3, 1)
 	})
 	tor.AddPeers([]PeerInfo{{Addr: retryDeadAddr}})
 	eventually(t, 2*time.Second, "peer parked", func() bool { return parkedCount(tor) == 1 })
 
-	// Pump the paths that fan out openNewConns: explicit calls and fresh
-	// discoveries releasing half-open slots.
-	tor.openNewConns()
-	tor.AddPeers([]PeerInfo{{Addr: retryTestAddrPort(2)}})
-	tor.openNewConns()
+	// Hold the sole global half-open slot on a second dial. The third peer
+	// cannot start until noLongerHalfOpen fans out after that slot is released.
+	require.True(t, cl.config.DialRateLimiter.Reserve().OK())
+	second := retryTestAddrPort(2)
+	third := retryTestAddrPort(3)
+	tor.AddPeers([]PeerInfo{{Addr: second}})
+	eventually(t, 2*time.Second, "second dial became half-open", func() bool {
+		cl.lock()
+		defer cl.unlock()
+		return tor.connectingToPeerAddr(second.String())
+	})
+	tor.AddPeers([]PeerInfo{{Addr: third}})
+	cl.lock()
+	pending := tor.peers.Len()
+	cl.unlock()
+	require.Equal(t, 1, pending, "third dial must wait for the global slot")
 
 	key := retryDeadAddr.String()
-	eventually(t, 2*time.Second, "second peer settled", func() bool {
-		return parkedCount(tor) <= 2
+	eventually(t, 4*time.Second, "fan-out initiated and settled third dial", func() bool {
+		cl.lock()
+		defer cl.unlock()
+		_, parked := tor.failedPeers[third.String()]
+		return parked && !tor.connectingToPeerAddr(third.String())
 	})
-	tor.cl.lock()
-	defer tor.cl.unlock()
+	cl.lock()
+	defer cl.unlock()
 	_, halfOpen := tor.halfOpen[key]
 	require.False(t, halfOpen, "parked address must not be redialed by fan-out")
 	require.Contains(t, tor.failedPeers, key, "parked entry must survive fan-out")
@@ -173,9 +189,65 @@ func TestWantPeersAndNumWantIgnoreParkedPeers(t *testing.T) {
 	require.EqualValues(t, 200, req.NumWant, "tracker must be asked for peers while only parked")
 }
 
-// A successful connection clears failure history: a later failure starts the
-// count from one. (Mirrors what outgoingConnection does on success.)
+// A successful outbound connection must clear its parked history through the
+// actual outgoingConnection path, not just the eviction helper.
 func TestSuccessClearsFailureHistory(t *testing.T) {
+	cl, tor := newRetryTestClient(t, func(cfg *ClientConfig) {
+		cfg.OutgoingPeerRetryBaseDelay = time.Hour
+	})
+	peerClient, _ := newRetryTestClient(t, nil)
+	addrs := peerClient.ListenAddrs()
+	require.NotEmpty(t, addrs)
+	p := PeerInfo{Addr: addrs[0], Trusted: true}
+	key := peerRetryKey(p)
+	cl.lock()
+	cl.parkFailedOutgoingPeer(tor, p)
+	cl.parkFailedOutgoingPeer(tor, p)
+	cl.unlock()
+	require.Equal(t, 2, parkedFailcount(tor, key))
+	cl.retryDueFailedPeer(tor, key)
+	eventually(t, 3*time.Second, "outbound handshake clears failed history", func() bool {
+		cl.lock()
+		defer cl.unlock()
+		_, parked := tor.failedPeers[key]
+		return !parked && tor.hasPeerConnForAddr(p.Addr)
+	})
+}
+
+// The watchdog only protects a retry still waiting in the ready pool. A dial
+// can wait on the rate limiter and handshakes for longer than the watchdog;
+// once half-open, only the actual outcome may change its failure history.
+func TestStartedRetryKeepsHistoryUntilDialFinishes(t *testing.T) {
+	cl, tor := newRetryTestClient(t, func(cfg *ClientConfig) {
+		cfg.OutgoingPeerRetryBaseDelay = time.Hour
+		cfg.DialRateLimiter = rate.NewLimiter(1, 1)
+	})
+	p := PeerInfo{Addr: retryDeadAddr}
+	key := peerRetryKey(p)
+	cl.lock()
+	cl.parkFailedOutgoingPeer(tor, p)
+	cl.unlock()
+	// Use up the burst to leave the half-open attempt waiting before dial.
+	require.True(t, cl.config.DialRateLimiter.Reserve().OK())
+	cl.retryDueFailedPeer(tor, key)
+	func() {
+		cl.lock()
+		defer cl.unlock()
+		e := tor.failedPeers[key]
+		require.NotNil(t, e)
+		require.True(t, e.inFlight)
+		require.True(t, tor.connectingToPeerAddr(key))
+		require.Nil(t, e.timer, "watchdog must stop once a real dial starts")
+	}()
+	eventually(t, 3*time.Second, "delayed dial increments failure count", func() bool {
+		cl.lock()
+		defer cl.unlock()
+		e, ok := tor.failedPeers[key]
+		return ok && e.failcount == 2
+	})
+}
+
+func TestQueuedRetryKeepsWatchdogUntilAttemptStarts(t *testing.T) {
 	cl, tor := newRetryTestClient(t, func(cfg *ClientConfig) {
 		cfg.OutgoingPeerRetryBaseDelay = time.Hour
 	})
@@ -183,12 +255,43 @@ func TestSuccessClearsFailureHistory(t *testing.T) {
 	key := peerRetryKey(p)
 	cl.lock()
 	cl.parkFailedOutgoingPeer(tor, p)
-	cl.parkFailedOutgoingPeer(tor, p)
-	require.Equal(t, 2, tor.failedPeers[key].failcount)
-	cl.evictFailedPeerLocked(tor, key)
-	cl.parkFailedOutgoingPeer(tor, p)
-	require.Equal(t, 1, tor.failedPeers[key].failcount, "history must not survive success eviction")
+	tor.maxEstablishedConns = 0
 	cl.unlock()
+	cl.retryDueFailedPeer(tor, key)
+	func() {
+		cl.lock()
+		defer cl.unlock()
+		require.NotNil(t, tor.failedPeers[key].timer, "undialed candidate needs a watchdog")
+		require.Equal(t, 1, tor.peers.Len())
+		tor.maxEstablishedConns = 50
+		tor.openNewConns()
+		require.True(t, tor.connectingToPeerAddr(key))
+		require.Nil(t, tor.failedPeers[key].timer, "watchdog must stop when queued peer starts dialing")
+	}()
+}
+
+func TestSkippedRetryDoesNotSuppressRediscovery(t *testing.T) {
+	cl, tor := newRetryTestClient(t, func(cfg *ClientConfig) {
+		cfg.OutgoingPeerRetryBaseDelay = time.Hour
+	})
+	p := PeerInfo{Addr: retryDeadAddr, Id: cl.peerID}
+	key := peerRetryKey(p)
+	cl.lock()
+	cl.parkFailedOutgoingPeer(tor, p)
+	cl.unlock()
+	cl.retryDueFailedPeer(tor, key)
+	cl.lock()
+	_, parked := tor.failedPeers[key]
+	connecting := tor.connectingToPeerAddr(key)
+	cl.unlock()
+	require.False(t, parked, "a self-peer skipped before dial has no outcome to clear its record")
+	require.False(t, connecting)
+}
+
+func parkedFailcount(tor *Torrent, key string) int {
+	tor.cl.lock()
+	defer tor.cl.unlock()
+	return tor.failedPeers[key].failcount
 }
 
 // The failed-set has explicit capacity: insertion at capacity evicts the entry

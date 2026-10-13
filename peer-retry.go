@@ -36,8 +36,8 @@ type failedPeerEntry struct {
 	// The deadline passed and the candidate was returned to the ready
 	// reserve; the record is kept (suppression continues) so the attempt's
 	// outcome can continue the failcount. Cleared when the attempt parks
-	// again. A watchdog evicts an inFlight record whose attempt never
-	// concluded, so a lost candidate cannot suppress rediscovery forever.
+	// again. A watchdog evicts a candidate that stays in the ready pool
+	// without ever starting a dial, so it cannot suppress rediscovery forever.
 	inFlight bool
 }
 
@@ -130,22 +130,45 @@ func (cl *Client) retryDueFailedPeer(t *Torrent, key string) {
 		e.timer.Stop()
 		e.timer = nil
 	}
-	// Watchdog: if the attempt never concludes (the ready candidate was
-	// trimmed without being dialed and the record went stale), forget it so
-	// rediscovery is not suppressed forever.
+	// Watchdog only covers a candidate waiting in the ready pool. Once a dial
+	// starts, openNewConns cancels it: rate-limiter wait and handshake fallback
+	// can take longer than this delay while the half-open attempt is healthy.
 	watchdogDelay := 2 * max(cl.config.NominalDialTimeout, 5*time.Second)
-	e.timer = time.AfterFunc(watchdogDelay, func() {
+	var watchdog *time.Timer
+	watchdog = time.AfterFunc(watchdogDelay, func() {
 		cl.lock()
 		defer cl.unlock()
-		if e, ok := t.failedPeers[key]; ok && e.inFlight {
+		if e, ok := t.failedPeers[key]; ok && e.inFlight && e.timer == watchdog {
 			cl.evictFailedPeerLocked(t, key)
 			torrent.Add("outgoing peer retries forgotten (watchdog)", 1)
 		}
 	})
+	e.timer = watchdog
 	t.peers.AddReturningReplacedPeer(e.peerInfo)
 	t.openNewConns()
 	cl.event.Broadcast()
 	torrent.Add("outgoing peer retries issued", 1)
+}
+
+// Called after a ready candidate is popped. A started half-open attempt owns
+// its outcome, however long the limiter and handshakes take; the ready-pool
+// watchdog must not discard its failure count. If initiateConn skipped the
+// candidate, no outcome will arrive, so discard the stale suppression now.
+// The Client lock is held by openNewConns.
+func (t *Torrent) retryReadyPeerPopped(p PeerInfo) {
+	key := peerRetryKey(p)
+	e, ok := t.failedPeers[key]
+	if !ok || !e.inFlight {
+		return
+	}
+	if !t.connectingToPeerAddr(key) {
+		t.cl.evictFailedPeerLocked(t, key)
+		return
+	}
+	if e.timer != nil {
+		e.timer.Stop()
+		e.timer = nil
+	}
 }
 
 // clearFailedPeers is torrent teardown: stop timers and release records. Must

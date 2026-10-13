@@ -1775,6 +1775,7 @@ func (t *Torrent) openNewConns() (initiated int) {
 			fromReadyPool:            true,
 		}
 		initiateConn(opts, false)
+		t.retryReadyPeerPopped(p)
 		initiated++
 		if t.cl.check.Try() {
 			panicif.NotEq(numPeers, t.peers.Len())
