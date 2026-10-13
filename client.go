@@ -1012,6 +1012,10 @@ type outgoingConnOpts struct {
 	// Outgoing connection attempt is in response to holepunch connect message.
 	receivedHolepunchConnect bool
 	HeaderObfuscationPolicy  HeaderObfuscationPolicy
+	// Attempt came from the ready reserve via openNewConns. Only such
+	// failures belong in the failed-dial cooldown; holepunch- and
+	// rendezvous-initiated attempts have their own rules.
+	fromReadyPool bool
 }
 
 // Called to dial out and run a connection. The addr we're given is already
@@ -1026,6 +1030,17 @@ func (cl *Client) outgoingConnection(
 	}
 	cl.lock()
 	defer cl.unlock()
+	// Park a failed ordinary attempt BEFORE releasing the half-open slot:
+	// noLongerHalfOpen fans openNewConns out to every torrent, and the cooling
+	// record must already be installed when that happens, or the same address
+	// can be redialed immediately. See peer-retry.go.
+	if err != nil && opts.fromReadyPool {
+		cl.parkFailedOutgoingPeer(opts.t, opts.peerInfo)
+	} else if err == nil {
+		// Defensive: a successful connection must not carry a stale cooldown
+		// record.
+		cl.evictFailedPeerLocked(opts.t, peerRetryKey(opts.peerInfo))
+	}
 	// Don't release lock between here and addPeerConn, unless it's for failure.
 	cl.noLongerHalfOpen(opts.t, opts.peerInfo.Addr.String(), attemptKey)
 	if err != nil {
@@ -1514,6 +1529,7 @@ func (cl *Client) newTorrentOpt(opts AddTorrentOpts) (t *Torrent) {
 		initialPieceCheckDisabled:       opts.DisableInitialPieceCheck,
 	}
 	g.MakeMap(&t.webSeeds)
+	t.failedPeers = make(map[string]*failedPeerEntry)
 	t.closedCtx, t.closedCtxCancel = context.WithCancelCause(context.Background())
 	t.getInfoCtx, t.getInfoCtxCancel = context.WithCancelCause(t.closedCtx)
 	var salt [8]byte

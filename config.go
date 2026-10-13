@@ -124,6 +124,26 @@ type ClientConfig struct {
 
 	// User-provided Client peer ID. If not present, one is generated automatically.
 	PeerID string
+
+	// Failed outgoing dial/handshake retry. A candidate whose ordinary
+	// outbound attempt fails is parked in a per-torrent cooldown with bounded
+	// exponential backoff instead of being discarded until rediscovery.
+	// Parked entries are not part of the ready reserve, so tracker demand
+	// (WantPeers/NumWant) is unaffected. The existing DialRateLimiter and
+	// half-open caps pace retries; no second throttle is added.
+	DisableOutgoingPeerRetry bool
+	// Attempts before the address is evicted from the cooldown and must be
+	// rediscovered to be retried again.
+	OutgoingPeerRetryMaxFailcount int
+	// Backoff for the first retry; doubled per subsequent failure, capped by
+	// OutgoingPeerRetryMaxDelay.
+	OutgoingPeerRetryBaseDelay time.Duration
+	OutgoingPeerRetryMaxDelay  time.Duration
+	// Per-torrent capacity of the cooldown set. Insertion at capacity evicts
+	// the entry closest to eviction anyway (highest failcount, earliest
+	// deadline). A capped delay does not bound the set by itself.
+	OutgoingPeerRetrySetCapacity int
+
 	// For the bittorrent protocol.
 	DisableUTP bool
 	// For the bittorrent protocol.
@@ -303,6 +323,11 @@ func NewDefaultClientConfig() *ClientConfig {
 		StealRequestGrace:      initDurationFromEnv(stealRequestGraceEnvKey, defaultStealRequestGrace),
 		DialRateLimiter:        rate.NewLimiter(10, 10),
 		PieceHashersPerTorrent: 2,
+
+		OutgoingPeerRetryMaxFailcount: defaultOutgoingPeerRetryMaxFailcount,
+		OutgoingPeerRetryBaseDelay:    defaultOutgoingPeerRetryBaseDelay,
+		OutgoingPeerRetryMaxDelay:     defaultOutgoingPeerRetryMaxDelay,
+		OutgoingPeerRetrySetCapacity:  defaultOutgoingPeerRetrySetCapacity,
 	}
 	cc.DhtStartingNodes = func(network string) dht.StartingNodesGetter {
 		return func() ([]dht.Addr, error) { return dht.GlobalBootstrapAddrs(network) }

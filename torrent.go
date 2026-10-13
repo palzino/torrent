@@ -143,6 +143,10 @@ type Torrent struct {
 	// them. That encourages us to reconnect to peers that are well known in
 	// the swarm.
 	peers prioritizedPeers
+	// Peers whose ordinary outbound attempt failed, keyed by address, cooling
+	// down before they are returned to the ready reserve above. Not part of
+	// the ready reserve: wantPeers and PopMax never see them. See peer-retry.go.
+	failedPeers map[string]*failedPeerEntry
 	// An announcer for each tracker URL. Note this includes non-regular trackers too.
 	trackerAnnouncers           map[torrentTrackerAnnouncerKey]torrentTrackerAnnouncer
 	regularTrackerAnnounceState map[torrentTrackerAnnouncerKey]*announceState
@@ -373,6 +377,13 @@ func (t *Torrent) addPeer(p PeerInfo) (added bool) {
 			// cl.logger.Printf("peers not added because of bad addr: %v", p)
 			return false
 		}
+	}
+	// A cooling address must not re-enter the ready reserve before its retry
+	// deadline: rediscovery here would defeat the cooldown, and addPeer calls
+	// openNewConns immediately, redialing the failed address. Refresh the
+	// record's metadata and wait for the deadline.
+	if t.retryCooling(p) {
+		return false
 	}
 	if replaced, ok := t.peers.AddReturningReplacedPeer(p); ok {
 		torrent.Add("peers replaced", 1)
@@ -1100,6 +1111,8 @@ func (t *Torrent) numPiecesCompleted() (num pieceIndex) {
 func (t *Torrent) close(wg *sync.WaitGroup) {
 	// Should only be called from the Client.
 	panicif.False(t.closed.Set())
+	// Release retry timers and records before anything else observes them.
+	t.clearFailedPeers()
 	t.eachShortInfohash(func(short [20]byte) {
 		delete(t.cl.torrentsByShortHash, short)
 	})
@@ -1759,6 +1772,7 @@ func (t *Torrent) openNewConns() (initiated int) {
 			skipHolepunchRendezvous:  false,
 			receivedHolepunchConnect: false,
 			HeaderObfuscationPolicy:  t.cl.config.HeaderObfuscationPolicy,
+			fromReadyPool:            true,
 		}
 		initiateConn(opts, false)
 		initiated++
